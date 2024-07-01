@@ -6,30 +6,42 @@ use arrow::{
 use arrow_udf::function;
 use async_stream::stream;
 use async_trait::async_trait;
-use datafusion::prelude::*;
+use datafusion::{common::tree_node::TreeNodeIterator, prelude::*};
 use futures_util::Stream;
 use futures_util::StreamExt;
 use std::{pin::Pin, sync::Arc};
 
-#[function("gcd(float32, float32) -> float32", output = "eval_mul_f32")]
+#[function("mul(float32, float32) -> float32", output = "eval_mul_f32")]
 fn mul(a: f32, b: f32) -> f32 {
     a * b
 }
 
-#[async_trait]
 pub trait Apply {
-    async fn apply<F, T>(&self, f: F) -> T
+    fn apply<F, T>(&self, f: F) -> T
     where
-        F: Fn(&RecordBatch) -> T + Send;
+        F: Fn(&RecordBatch) -> T;
 }
 
-#[async_trait]
 impl Apply for RecordBatch {
-    async fn apply<F, T>(&self, f: F) -> T
+    fn apply<F, T>(&self, f: F) -> T
     where
-        F: Fn(&RecordBatch) -> T + Send,
+        F: Fn(&RecordBatch) -> T,
     {
         f(self)
+    }
+}
+
+pub trait ApplyVec {
+    fn apply<F, T>(&self, f: F) -> Vec<T>
+    where
+        F: Fn(&RecordBatch) -> T;
+}
+impl ApplyVec for Vec<RecordBatch> {
+    fn apply<F, T>(&self, f: F) -> Vec<T>
+    where
+        F: Fn(&RecordBatch) -> T,
+    {
+        self.iter().map(|rb| f(rb)).collect::<Vec<T>>()
     }
 }
 
@@ -74,7 +86,7 @@ async fn main() -> Result<()> {
     let rb = RecordBatch::try_new(schema.clone(), vec![a, b]).unwrap();
 
     println!("Testing apply/lambda with RecordBatch");
-    let res = rb.apply(eval_mul_f32).await.unwrap();
+    let res = rb.apply(eval_mul_f32).unwrap();
 
     println!("a, b = {:?}", rb);
     println!("a * b = {:?}", res);
@@ -82,14 +94,28 @@ async fn main() -> Result<()> {
     let sc = SessionContext::new();
     sc.register_batch("my_table", rb)?;
 
-    let df = sc.sql("select a,b from my_table").await.unwrap();
+    let mut res = sc
+        .sql("select a,b from my_table")
+        .await
+        .unwrap()
+        .apply(eval_mul_f32)
+        .await;
 
     println!("Testing apply/lambda with dataframe");
-    let mut res = df.apply(eval_mul_f32).await;
 
     while let Some(z) = res.next().await {
         println!("{:?}", z.unwrap());
     }
+
+    let coll = sc
+        .sql("select a,b from my_table")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let coll = coll.apply(eval_mul_f32);
 
     Ok(())
 }
